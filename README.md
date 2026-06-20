@@ -2,14 +2,30 @@
 
 POC for pinging a coworker through Claude Code.
 
-- `relay.py`: hosted FastAPI + SQLite relay.
-- `server.py`: local stdio MCP server that each person points at the relay.
+- `relay.py`: hosted FastAPI + SQLite relay plus remote MCP endpoint.
+- `server.py`: optional local stdio MCP bridge.
 
 This is same-trust v0: no auth, no web UI, no push, no passwords.
 
-## Local Install
+## Fast Remote MCP Setup
 
-Each person who wants to use the MCP tools needs a local checkout of this repo:
+No local repo or Python install is required for the remote MCP path. Add the hosted MCP endpoint:
+
+```bash
+claude mcp add --transport http ctalk https://ctalk-relay.onrender.com/mcp -s user
+```
+
+Then register in Claude Code:
+
+```text
+ctalk register me with user_id umar. My name is Umar. I own platform tooling.
+```
+
+Because this v0 has no auth, remote MCP prompts should include your `user_id`, such as `umar` or `john`.
+
+## Optional Local Stdio Install
+
+If you want to run the MCP bridge locally instead of using hosted MCP:
 
 ```bash
 cd /path/to/ctalk
@@ -18,9 +34,9 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## Deploy The Relay
+## Deploy
 
-The relay is the only hosted piece. Everyone's local MCP server points to the same relay URL.
+The hosted app serves both the REST relay and the remote MCP endpoint at `/mcp`.
 
 ### Render
 
@@ -81,50 +97,16 @@ Expected:
 {"status":"ok"}
 ```
 
-## Add ctalk To Claude Code
-
-Each person adds one MCP server named `ctalk`, using their own `CURRENT_USER_ID` and the shared deployed relay URL.
-
-```bash
-claude mcp add-json ctalk '{
-  "type": "stdio",
-  "command": "/absolute/path/to/ctalk/.venv/bin/python",
-  "args": ["/absolute/path/to/ctalk/server.py"],
-  "env": {
-    "RELAY_URL": "https://your-relay-url",
-    "CURRENT_USER_ID": "umar"
-  }
-}'
-```
-
-John uses the same `RELAY_URL`, but sets:
-
-```json
-"CURRENT_USER_ID": "john"
-```
-
-Check the MCP server:
-
-```bash
-claude mcp list
-```
-
-You should see:
-
-```text
-ctalk ... ✓ Connected
-```
-
 ## First Run
 
 Each person registers once from Claude Code:
 
 ```text
-ctalk register me as Umar. I own alpha-repo and platform tooling.
+ctalk register me with user_id umar. My name is Umar. I own alpha-repo and platform tooling.
 ```
 
 ```text
-ctalk register me as John. I own alpha-repo and payments-service.
+ctalk register me with user_id john. My name is John. I own alpha-repo and payments-service.
 ```
 
 ## Send A Message
@@ -132,41 +114,41 @@ ctalk register me as John. I own alpha-repo and payments-service.
 Ask:
 
 ```text
-ctalk ask john: What is the retry logic in alpha-repo?
+ctalk ask john from umar: What is the retry logic in alpha-repo?
 ```
 
 John checks:
 
 ```text
-ctalk check my inbox.
+ctalk check inbox for john.
 ```
 
 John drafts:
 
 ```text
-ctalk propose a response to message 1: The retry logic uses three attempts with exponential backoff.
+ctalk propose a response as john to message 1: The retry logic uses three attempts with exponential backoff.
 ```
 
 After John explicitly approves:
 
 ```text
-ctalk send the approved response to message 1: The retry logic uses three attempts with exponential backoff.
+ctalk send the approved response as john to message 1: The retry logic uses three attempts with exponential backoff.
 ```
 
 Umar checks replies:
 
 ```text
-ctalk check my replies.
+ctalk check replies for umar.
 ```
 
 ## Tools
 
-- `register_self(name, ownership, notes = "")`: creates your roster profile.
-- `ask_person(to_id, question)`: confirms the recipient exists, then posts a question.
-- `check_inbox()`: returns pending questions plus sender roster context.
-- `propose_response(message_id, draft_text)`: saves a draft only.
-- `send_response(message_id, final_text)`: delivers the answer after explicit human approval.
-- `check_replies()`: polls answers since `~/.ctalk/last_checked.<CURRENT_USER_ID>`.
+- `register_self(user_id, name, ownership, notes = "")`: creates your roster profile.
+- `ask_person(from_id, to_id, question)`: confirms the recipient exists, then posts a question.
+- `check_inbox(user_id)`: returns pending questions plus sender roster context.
+- `propose_response(user_id, message_id, draft_text)`: saves a draft only.
+- `send_response(user_id, message_id, final_text)`: delivers the answer after explicit human approval.
+- `check_replies(user_id, since = "1970-01-01T00:00:00+00:00")`: polls answers.
 
 ## HTTP API
 
