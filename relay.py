@@ -27,6 +27,7 @@ remote_mcp = FastMCP(
         "check inboxes, draft replies, and send approved replies. Because this hosted "
         "v0 has no auth, tools require an explicit user_id/from_id argument."
     ),
+    host="0.0.0.0",
     stateless_http=True,
 )
 
