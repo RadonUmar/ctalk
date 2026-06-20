@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.py[cod]
+.last_checked*
+relay.sqlite3
+*.sqlite3
+.DS_Store
+.env
+.claude/

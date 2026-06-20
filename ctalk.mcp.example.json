@@ -1,0 +1,9 @@
+{
+  "type": "stdio",
+  "command": "/absolute/path/to/ctalk/.venv/bin/python",
+  "args": ["/absolute/path/to/ctalk/server.py"],
+  "env": {
+    "RELAY_URL": "https://your-ctalk-relay.example.com",
+    "CURRENT_USER_ID": "your-id"
+  }
+}
