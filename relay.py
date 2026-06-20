@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import sqlite3
 from contextlib import contextmanager
@@ -8,6 +9,8 @@ from typing import Any
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
+
+logger = logging.getLogger(__name__)
 
 DB_PATH = os.environ.get("RELAY_DB_PATH", "relay.sqlite3")
 
@@ -59,9 +62,16 @@ def row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
 
 
 def init_db() -> None:
+    global DB_PATH
+
     db_dir = os.path.dirname(DB_PATH)
     if db_dir:
-        os.makedirs(db_dir, exist_ok=True)
+        try:
+            os.makedirs(db_dir, exist_ok=True)
+        except PermissionError:
+            fallback_path = "/tmp/relay.sqlite3"
+            logger.warning("Cannot write to %s; falling back to %s", db_dir, fallback_path)
+            DB_PATH = fallback_path
 
     with db() as conn:
         conn.execute(

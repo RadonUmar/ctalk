@@ -30,7 +30,17 @@ Render's FastAPI docs use:
 uvicorn relay:app --host 0.0.0.0 --port $PORT
 ```
 
-This repo includes `render.yaml` with that start command plus a persistent disk mounted at `/var/data`. Use:
+Free-tier Render services do not support persistent disks. For the free tier, use:
+
+```text
+Build Command: pip install -r requirements.txt
+Start Command: uvicorn relay:app --host 0.0.0.0 --port $PORT
+Environment: RELAY_DB_PATH=/tmp/relay.sqlite3
+```
+
+This works for a POC, but roster entries and messages may disappear after restarts or redeploys.
+
+If you upgrade and add a persistent disk, this repo includes `render.yaml` with that start command plus a disk mounted at `/var/data`. Use:
 
 ```text
 Build Command: pip install -r requirements.txt
@@ -39,7 +49,7 @@ Environment: RELAY_DB_PATH=/var/data/relay.sqlite3
 Disk Mount Path: /var/data
 ```
 
-Without a persistent disk, SQLite data can disappear when the service restarts or redeploys.
+Without a persistent disk, do not use `/var/data`.
 
 ### Railway
 
