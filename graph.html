@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ctalk — organization graph</title>
+<script src="https://unpkg.com/cytoscape@3.30.2/dist/cytoscape.min.js"></script>
+<style>
+  :root { --bg:#0f1419; --panel:#1a2129; --text:#e6edf3; --muted:#8b97a3; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--text);
+    font-family:-apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+  #bar { display:flex; gap:12px; align-items:center; flex-wrap:wrap;
+    padding:10px 14px; background:var(--panel); border-bottom:1px solid #2b3340; }
+  #bar h1 { font-size:15px; margin:0 8px 0 0; font-weight:600; }
+  #bar label { font-size:13px; color:var(--muted); display:flex; align-items:center; gap:6px; }
+  #bar input, #bar select, #bar button {
+    background:#0f1419; color:var(--text); border:1px solid #2b3340; border-radius:6px;
+    padding:6px 8px; font-size:13px; }
+  #bar input#token { width:280px; }
+  #bar button { cursor:pointer; }
+  #status { font-size:13px; color:var(--muted); }
+  #status.error { color:#ff6b6b; }
+  #legend { display:flex; gap:14px; padding:8px 14px; font-size:12px; color:var(--muted);
+    background:var(--panel); border-bottom:1px solid #2b3340; flex-wrap:wrap; }
+  .swatch { display:inline-block; width:11px; height:11px; border-radius:50%; margin-right:5px;
+    vertical-align:middle; }
+  .eswatch { display:inline-block; width:18px; height:0; border-top:3px solid; margin-right:5px;
+    vertical-align:middle; }
+  #cy { width:100%; height:calc(100vh - 96px); display:block; }
+</style>
+</head>
+<body>
+  <div id="bar">
+    <h1>ctalk org graph</h1>
+    <label>auth token <input id="token" type="text" placeholder="ctalk_auth_..." /></label>
+    <label>layout
+      <select id="layout">
+        <option value="breadthfirst">Hierarchy</option>
+        <option value="cose">Force-directed</option>
+      </select>
+    </label>
+    <label><input id="showSkills" type="checkbox" checked /> show skills</label>
+    <button id="reload">Load graph</button>
+    <span id="status">Enter an auth token and click “Load graph”.</span>
+  </div>
+  <div id="legend">
+    <span><span class="swatch" style="background:#4f86c6"></span>Person</span>
+    <span><span class="swatch" style="background:#e8923b"></span>Project</span>
+    <span><span class="swatch" style="background:#5fa667"></span>Skill</span>
+    <span><span class="eswatch" style="border-color:#aab4c0"></span>reports to</span>
+    <span><span class="eswatch" style="border-color:#e8923b"></span>owns</span>
+    <span><span class="eswatch" style="border-color:#c9a06a;border-top-style:dashed"></span>contributed</span>
+    <span><span class="eswatch" style="border-color:#5fa667;border-top-style:dashed"></span>has skill</span>
+    <span><span class="eswatch" style="border-color:#6b7785;border-top-style:dotted"></span>interacted</span>
+  </div>
+  <div id="cy"></div>
+
+<script>
+const NODE_COLORS = { Person: "#4f86c6", Project: "#e8923b", Skill: "#5fa667" };
+const params = new URLSearchParams(location.search);
+const tokenInput = document.getElementById("token");
+const statusEl = document.getElementById("status");
+const layoutSel = document.getElementById("layout");
+const showSkills = document.getElementById("showSkills");
+tokenInput.value = params.get("token") || params.get("auth_token") || "";
+if (params.get("layout")) layoutSel.value = params.get("layout");
+
+let cy = null;
+let lastData = null;
+
+function setStatus(msg, isError) {
+  statusEl.textContent = msg;
+  statusEl.className = isError ? "error" : "";
+}
+
+const style = [
+  { selector: "node", style: {
+      "background-color": ele => NODE_COLORS[ele.data("type")] || "#888",
+      "label": "data(label)", "color": "#e6edf3", "font-size": "11px",
+      "text-valign": "center", "text-halign": "center", "text-wrap": "wrap",
+      "text-max-width": "120px", "width": 34, "height": 34,
+      "border-width": 1, "border-color": "#0f1419", "text-outline-width": 2,
+      "text-outline-color": "#0f1419" } },
+  { selector: 'node[type="Project"]', style: { "shape": "round-rectangle", "width": 56, "height": 30 } },
+  { selector: 'node[type="Skill"]', style: { "shape": "diamond", "width": 26, "height": 26, "font-size": "10px" } },
+  { selector: "edge", style: {
+      "curve-style": "bezier", "width": 1.5, "line-color": "#6b7785",
+      "target-arrow-color": "#6b7785", "target-arrow-shape": "triangle",
+      "arrow-scale": 0.8, "font-size": "9px", "color": "#8b97a3" } },
+  { selector: 'edge[type="REPORTS_TO"]', style: { "line-color": "#aab4c0",
+      "target-arrow-color": "#aab4c0", "width": 2, "label": "reports to" } },
+  { selector: 'edge[type="OWNS"]', style: { "line-color": "#e8923b",
+      "target-arrow-color": "#e8923b", "width": 2, "label": "data(role)" } },
+  { selector: 'edge[type="CONTRIBUTED_TO"]', style: { "line-color": "#c9a06a",
+      "target-arrow-color": "#c9a06a", "line-style": "dashed", "label": "contributor",
+      "width": ele => Math.min(5, 1 + (ele.data("commits") || 0) / 40) } },
+  { selector: 'edge[type="HAS_SKILL"]', style: { "line-color": "#5fa667",
+      "target-arrow-color": "#5fa667", "line-style": "dashed", "target-arrow-shape": "none" } },
+  { selector: 'edge[type="INTERACTED_WITH"]', style: { "line-color": "#6b7785",
+      "target-arrow-color": "#6b7785", "line-style": "dotted",
+      "width": ele => Math.min(6, 1 + (ele.data("count") || 1)) } },
+];
+
+function buildElements(data, includeSkills) {
+  const nodes = data.nodes.filter(n => includeSkills || n.type !== "Skill");
+  const keep = new Set(nodes.map(n => n.id));
+  const els = [];
+  for (const n of nodes) els.push({ data: { ...n } });
+  for (const e of data.edges) {
+    if (!keep.has(e.source) || !keep.has(e.target)) continue;
+    els.push({ data: { id: `${e.source}->${e.target}:${e.type}`, ...e } });
+  }
+  return els;
+}
+
+// Reporting levels from REPORTS_TO only (source=report -> target=manager).
+// A person's level is 1 + the deepest manager's level (matrix: max over managers).
+function reportingLevels(data) {
+  const managersOf = {};
+  data.nodes.forEach(n => { if (n.type === "Person") managersOf[n.id] = []; });
+  data.edges.filter(e => e.type === "REPORTS_TO").forEach(e => {
+    if (managersOf[e.source]) managersOf[e.source].push(e.target);
+  });
+  const level = {};
+  const depth = (id, seen) => {
+    if (level[id] !== undefined) return level[id];
+    const mgrs = managersOf[id] || [];
+    if (!mgrs.length) return (level[id] = 0);
+    if (seen.has(id)) return 0;            // cycle guard
+    seen.add(id);
+    const d = 1 + Math.max(...mgrs.map(m => depth(m, seen)));
+    seen.delete(id);
+    return (level[id] = d);
+  };
+  Object.keys(managersOf).forEach(id => depth(id, new Set()));
+  return level;
+}
+
+function avgX(pos, ids) {
+  const known = ids.filter(i => pos[i]);
+  if (!known.length) return 0;
+  return known.reduce((s, i) => s + pos[i].x, 0) / known.length;
+}
+
+// Custom org-chart layout: people in reporting bands (top managers up top),
+// then a projects band, then a skills band; children roughly under their parents.
+function presetPositions(data) {
+  const ROWH = 140, COLW = 150, SKW = 95;
+  const pos = {};
+  const level = reportingLevels(data);
+  const persons = data.nodes.filter(n => n.type === "Person").map(n => n.id);
+  const byLevel = {};
+  persons.forEach(id => (byLevel[level[id]] ||= []).push(id));
+  Object.keys(byLevel).forEach(lv => {
+    const row = byLevel[lv];
+    row.forEach((id, i) => { pos[id] = { x: (i - (row.length - 1) / 2) * COLW, y: lv * ROWH }; });
+  });
+  const maxLevel = persons.length ? Math.max(...persons.map(p => level[p])) : 0;
+
+  const ownersOf = {};
+  const projects = data.nodes.filter(n => n.type === "Project").map(n => n.id);
+  projects.forEach(p => (ownersOf[p] = []));
+  data.edges.filter(e => e.type === "OWNS").forEach(e => { ownersOf[e.target]?.push(e.source); });
+  const projY = (maxLevel + 1) * ROWH + 30;
+  projects.sort((a, b) => avgX(pos, ownersOf[a]) - avgX(pos, ownersOf[b]));
+  projects.forEach((id, i) => { pos[id] = { x: (i - (projects.length - 1) / 2) * COLW, y: projY }; });
+
+  const holdersOf = {};
+  const skills = data.nodes.filter(n => n.type === "Skill").map(n => n.id);
+  skills.forEach(s => (holdersOf[s] = []));
+  data.edges.filter(e => e.type === "HAS_SKILL").forEach(e => { holdersOf[e.target]?.push(e.source); });
+  const skillY = (maxLevel + 2) * ROWH + 40;
+  skills.sort((a, b) => avgX(pos, holdersOf[a]) - avgX(pos, holdersOf[b]));
+  skills.forEach((id, i) => { pos[id] = { x: (i - (skills.length - 1) / 2) * SKW, y: skillY }; });
+  return pos;
+}
+
+function layoutFor(name, data) {
+  if (name === "breadthfirst") {  // the "Hierarchy" option
+    return { name: "preset", positions: presetPositions(data), fit: true, padding: 40 };
+  }
+  return { name: "cose", animate: false, padding: 30, nodeRepulsion: 9000,
+    idealEdgeLength: 90, nestingFactor: 1.1 };
+}
+
+function render(data) {
+  const els = buildElements(data, showSkills.checked);
+  if (cy) cy.destroy();
+  cy = cytoscape({ container: document.getElementById("cy"), elements: els,
+    style, layout: layoutFor(layoutSel.value, data), wheelSensitivity: 0.2 });
+  window.cy = cy; // exposed for verification
+  const counts = data.nodes.reduce((acc, n) => (acc[n.type] = (acc[n.type] || 0) + 1, acc), {});
+  const shown = els.filter(e => !e.data.source).length;
+  setStatus(`org "${data.org_id}" — ${data.nodes.length} nodes / ${data.edges.length} edges `
+    + `(${counts.Person || 0} people, ${counts.Project || 0} projects, ${counts.Skill || 0} skills); `
+    + `showing ${shown} nodes.`);
+}
+
+async function load() {
+  const token = tokenInput.value.trim();
+  if (!token) { setStatus("Enter an auth token first.", true); return; }
+  setStatus("Loading…");
+  try {
+    const resp = await fetch(`/api/org-graph?auth_token=${encodeURIComponent(token)}`);
+    if (!resp.ok) {
+      const body = await resp.json().catch(() => ({}));
+      throw new Error(`HTTP ${resp.status}: ${body.detail || resp.statusText}`);
+    }
+    lastData = await resp.json();
+    render(lastData);
+  } catch (err) {
+    setStatus(err.message, true);
+  }
+}
+
+document.getElementById("reload").addEventListener("click", load);
+layoutSel.addEventListener("change", () => lastData && render(lastData));
+showSkills.addEventListener("change", () => lastData && render(lastData));
+if (tokenInput.value) load();
+</script>
+</body>
+</html>

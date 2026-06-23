@@ -7,3 +7,7 @@ relay.sqlite3
 .DS_Store
 .env
 .claude/
+
+# local verification artifacts
+.playwright-mcp/
+*.png

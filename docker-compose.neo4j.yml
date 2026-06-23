@@ -1,0 +1,24 @@
+# Local Neo4j for ctalk knowledge-graph development (ADR 0001).
+# Usage: docker compose -f docker-compose.neo4j.yml up -d
+# Browser: http://localhost:7474   Bolt: bolt://localhost:7687
+# Default dev creds (override with env): neo4j / ctalkdev123
+services:
+  neo4j:
+    image: neo4j:5.26
+    container_name: ctalk-neo4j
+    ports:
+      - "7474:7474"   # HTTP browser
+      - "7687:7687"   # Bolt driver
+    environment:
+      NEO4J_AUTH: "neo4j/ctalkdev123"
+      NEO4J_PLUGINS: '["apoc"]'
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:7474"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    volumes:
+      - ctalk-neo4j-data:/data
+
+volumes:
+  ctalk-neo4j-data:

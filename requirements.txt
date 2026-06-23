@@ -3,3 +3,4 @@ uvicorn
 mcp
 httpx
 psycopg[binary]
+neo4j

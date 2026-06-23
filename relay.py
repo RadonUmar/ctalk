@@ -5,6 +5,7 @@ import logging
 import os
 import secrets
 import sqlite3
+from collections import defaultdict
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,6 +14,8 @@ from typing import Any, Mapping
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from mcp.server.fastmcp import FastMCP
+
+import graph
 
 try:
     import psycopg
@@ -28,6 +31,7 @@ DB_PATH = os.environ.get("RELAY_DB_PATH", "relay.sqlite3")
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 USE_POSTGRES = bool(DATABASE_URL)
 SETUP_PAGE = Path(__file__).with_name("setup.html")
+GRAPH_PAGE = Path(__file__).with_name("graph.html")
 HASH_ITERATIONS = 200_000
 
 
@@ -50,8 +54,13 @@ remote_mcp = FastMCP(
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     init_db()
+    try:
+        graph.init_graph()
+    except Exception as exc:
+        logger.warning("Neo4j graph init skipped: %s", exc)
     async with remote_mcp.session_manager.run():
         yield
+    graph.close_driver()
 
 
 app = FastAPI(title="ctalk relay", lifespan=lifespan)
@@ -277,6 +286,9 @@ def init_db() -> None:
             )
             execute(conn, "ALTER TABLE organizations ADD COLUMN IF NOT EXISTS admin_password_hash TEXT")
             execute(conn, "ALTER TABLE users ADD COLUMN IF NOT EXISTS profile_notes TEXT NOT NULL DEFAULT ''")
+            execute(conn, "ALTER TABLE users ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT ''")
+            execute(conn, "ALTER TABLE users ADD COLUMN IF NOT EXISTS level TEXT NOT NULL DEFAULT ''")
+            execute(conn, "ALTER TABLE users ADD COLUMN IF NOT EXISTS commit_history_opt_in INTEGER NOT NULL DEFAULT 0")
         else:
             execute(
                 conn,
@@ -357,6 +369,80 @@ def init_db() -> None:
             )
             ensure_column(conn, "organizations", "admin_password_hash", "TEXT")
             ensure_column(conn, "users", "profile_notes", "TEXT NOT NULL DEFAULT ''")
+            ensure_column(conn, "users", "role", "TEXT NOT NULL DEFAULT ''")
+            ensure_column(conn, "users", "level", "TEXT NOT NULL DEFAULT ''")
+            ensure_column(conn, "users", "commit_history_opt_in", "INTEGER NOT NULL DEFAULT 0")
+        # --- knowledge-graph tables (SQL is the system of record; ADR 0002) ---
+        execute(conn,
+            """
+            CREATE TABLE IF NOT EXISTS projects (
+                org_id TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                repo_url TEXT NOT NULL DEFAULT '',
+                aliases TEXT NOT NULL DEFAULT '[]',
+                context TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (org_id, project_id)
+            )
+            """,
+        )
+        execute(conn,
+            """
+            CREATE TABLE IF NOT EXISTS project_ownership (
+                org_id TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'contributor',
+                PRIMARY KEY (org_id, project_id, user_id)
+            )
+            """,
+        )
+        execute(conn,
+            """
+            CREATE TABLE IF NOT EXISTS reporting (
+                org_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                manager_id TEXT NOT NULL,
+                PRIMARY KEY (org_id, user_id, manager_id)
+            )
+            """,
+        )
+        execute(conn,
+            """
+            CREATE TABLE IF NOT EXISTS skills (
+                org_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                skill TEXT NOT NULL,
+                PRIMARY KEY (org_id, user_id, skill)
+            )
+            """,
+        )
+        execute(conn,
+            """
+            CREATE TABLE IF NOT EXISTS project_context (
+                org_id TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                author_id TEXT NOT NULL DEFAULT '',
+                context_text TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (org_id, project_id, created_at)
+            )
+            """,
+        )
+        execute(conn,
+            """
+            CREATE TABLE IF NOT EXISTS contributions (
+                org_id TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                commits INTEGER NOT NULL DEFAULT 0,
+                last_commit_at TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (org_id, project_id, user_id)
+            )
+            """,
+        )
         execute(conn, "CREATE INDEX IF NOT EXISTS idx_users_org ON users (org_id)")
         execute(conn, "CREATE INDEX IF NOT EXISTS idx_messages_inbox ON org_messages (org_id, to_user_id, status)")
         execute(conn, "CREATE INDEX IF NOT EXISTS idx_messages_replies ON org_messages (org_id, from_user_id, status)")
@@ -807,6 +893,485 @@ def check_replies(auth_token: str, since: str = "1970-01-01T00:00:00+00:00") -> 
         "since": since,
         "replies": [message_to_dict(row) for row in rows],
     }
+
+
+# --- Knowledge-graph data layer (SQL of record -> Neo4j projection; ADR 0002) ---
+
+def _slugify(value: str) -> str:
+    allowed = "abcdefghijklmnopqrstuvwxyz0123456789"
+    out: list[str] = []
+    prev_dash = False
+    for char in value.strip().lower():
+        if char in allowed:
+            out.append(char)
+            prev_dash = False
+        elif not prev_dash:
+            out.append("-")
+            prev_dash = True
+    slug = "".join(out).strip("-")
+    return (slug or "project")[:64]
+
+
+def _org_snapshot(org_id: str) -> dict[str, Any]:
+    with db() as conn:
+        users = [
+            {"user_id": r["user_id"], "name": r["name"], "role": r["role"], "level": r["level"],
+             "commit_history_opt_in": bool(r["commit_history_opt_in"])}
+            for r in execute(conn, "SELECT user_id, name, role, level, commit_history_opt_in FROM users WHERE org_id = ?", (org_id,)).fetchall()
+        ]
+        projects = [
+            {
+                "project_id": r["project_id"], "name": r["name"], "description": r["description"],
+                "repo_url": r["repo_url"], "aliases": parse_json_list(r["aliases"]), "context": r["context"],
+            }
+            for r in execute(conn, "SELECT * FROM projects WHERE org_id = ?", (org_id,)).fetchall()
+        ]
+        ownership = [
+            {"project_id": r["project_id"], "user_id": r["user_id"], "role": r["role"]}
+            for r in execute(conn, "SELECT project_id, user_id, role FROM project_ownership WHERE org_id = ?", (org_id,)).fetchall()
+        ]
+        reporting = [
+            {"user_id": r["user_id"], "manager_id": r["manager_id"]}
+            for r in execute(conn, "SELECT user_id, manager_id FROM reporting WHERE org_id = ?", (org_id,)).fetchall()
+        ]
+        skills = [
+            {"user_id": r["user_id"], "skill": r["skill"]}
+            for r in execute(conn, "SELECT user_id, skill FROM skills WHERE org_id = ?", (org_id,)).fetchall()
+        ]
+        interactions = [
+            {"user_a_id": r["user_a_id"], "user_b_id": r["user_b_id"], "message_count": r["message_count"]}
+            for r in execute(conn, "SELECT user_a_id, user_b_id, message_count FROM user_interactions WHERE org_id = ?", (org_id,)).fetchall()
+        ]
+        # Only project commit data for users who currently consent (defense-in-depth:
+        # opt-out also deletes rows, but we never read non-consented data regardless).
+        contributions = [
+            {"project_id": r["project_id"], "user_id": r["user_id"], "commits": r["commits"], "last_commit_at": r["last_commit_at"]}
+            for r in execute(conn,
+                """
+                SELECT c.project_id, c.user_id, c.commits, c.last_commit_at
+                FROM contributions c
+                JOIN users u ON u.org_id = c.org_id AND u.user_id = c.user_id
+                WHERE c.org_id = ? AND u.commit_history_opt_in = 1
+                """,
+                (org_id,)).fetchall()
+        ]
+    return {
+        "users": users, "projects": projects, "ownership": ownership,
+        "reporting": reporting, "skills": skills, "interactions": interactions,
+        "contributions": contributions,
+    }
+
+
+def reproject_org(org_id: str) -> None:
+    """Rebuild the Neo4j projection for an org from SQL. Best-effort; never raises."""
+    if not graph.graph_enabled():
+        return
+    try:
+        graph.rebuild_org_graph(org_id, _org_snapshot(org_id))
+    except Exception as exc:
+        logger.warning("Graph projection for org '%s' failed: %s", org_id, exc)
+
+
+def _upsert_project(conn, org_id, project_id, name, description, repo_url, aliases, context) -> None:
+    # Merge with any existing project so a later onboarder (e.g. a maintainer) does not
+    # clobber the creator's richer metadata: union the aliases, and keep the existing
+    # description/repo_url/context whenever the incoming value is empty.
+    existing = execute(conn,
+        "SELECT name, description, repo_url, aliases, context FROM projects WHERE org_id = ? AND project_id = ?",
+        (org_id, project_id)).fetchone()
+    if existing is not None:
+        name = name or existing["name"]
+        description = description or existing["description"]
+        repo_url = repo_url or existing["repo_url"]
+        context = context or existing["context"]
+        merged = list(parse_json_list(existing["aliases"]))
+        for alias in aliases:
+            if alias not in merged:
+                merged.append(alias)
+        aliases = merged
+    execute(conn,
+        """
+        INSERT INTO projects (org_id, project_id, name, description, repo_url, aliases, context, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(org_id, project_id) DO UPDATE SET
+            name = excluded.name, description = excluded.description,
+            repo_url = excluded.repo_url, aliases = excluded.aliases, context = excluded.context
+        """,
+        (org_id, project_id, name, description, repo_url, json_list(aliases), context, utc_now()),
+    )
+
+
+def _set_ownership(conn, org_id, project_id, user_id, role) -> None:
+    execute(conn,
+        """
+        INSERT INTO project_ownership (org_id, project_id, user_id, role)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(org_id, project_id, user_id) DO UPDATE SET role = excluded.role
+        """,
+        (org_id, project_id, user_id, role),
+    )
+
+
+def _set_reporting(conn, org_id, user_id, manager_ids) -> list[str]:
+    execute(conn, "DELETE FROM reporting WHERE org_id = ? AND user_id = ?", (org_id, user_id))
+    saved = []
+    for manager_id in manager_ids:
+        manager_id = normalize_id(manager_id, "manager_id")
+        if manager_id == user_id:
+            continue  # no self-reporting
+        execute(conn,
+            "INSERT INTO reporting (org_id, user_id, manager_id) VALUES (?, ?, ?) "
+            "ON CONFLICT(org_id, user_id, manager_id) DO NOTHING",
+            (org_id, user_id, manager_id),
+        )
+        saved.append(manager_id)
+    return saved
+
+
+def _set_skills(conn, org_id, user_id, skills) -> list[str]:
+    execute(conn, "DELETE FROM skills WHERE org_id = ? AND user_id = ?", (org_id, user_id))
+    saved = []
+    for skill in skills:
+        skill = skill.strip()
+        if not skill:
+            continue
+        execute(conn,
+            "INSERT INTO skills (org_id, user_id, skill) VALUES (?, ?, ?) "
+            "ON CONFLICT(org_id, user_id, skill) DO NOTHING",
+            (org_id, user_id, skill),
+        )
+        saved.append(skill)
+    return saved
+
+
+@remote_mcp.tool()
+def onboard(
+    auth_token: str,
+    role: str = "",
+    level: str = "",
+    reports_to: list[str] | None = None,
+    skills: list[str] | None = None,
+    projects: list[dict] | None = None,
+    store_commit_history: bool = False,
+) -> dict[str, Any]:
+    """Save onboarding answers and update the org knowledge graph.
+
+    role/level describe the person; reports_to is a list of manager user_ids (matrix
+    reporting is allowed); skills is a list of skill names; projects is a list of dicts,
+    each: {name, role: creator|maintainer|contributor, description, repo_url, aliases[],
+    context}. `context` is the paragraph an agent needs to answer questions about that
+    project. store_commit_history records the user's CONSENT to have their commit
+    contribution counts stored (opt-in, default false); ingest them later with
+    record_commits.
+    """
+    user = require_auth(auth_token)
+    org_id, user_id = user["org_id"], user["user_id"]
+    reports_to = reports_to or []
+    skills = skills or []
+    projects = projects or []
+    valid_roles = {"creator", "maintainer", "contributor"}
+    saved_projects = []
+    with db() as conn:
+        execute(conn, "UPDATE users SET role = ?, level = ?, commit_history_opt_in = ? WHERE org_id = ? AND user_id = ?",
+                (role, level, 1 if store_commit_history else 0, org_id, user_id))
+        saved_managers = _set_reporting(conn, org_id, user_id, reports_to)
+        saved_skills = _set_skills(conn, org_id, user_id, skills)
+        for proj in projects:
+            name = (str(proj.get("name") or proj.get("project_id") or "")).strip()
+            if not name:
+                continue
+            project_id = normalize_id(proj["project_id"], "project_id") if proj.get("project_id") else _slugify(name)
+            owner_role = proj.get("role", "contributor")
+            if owner_role not in valid_roles:
+                owner_role = "contributor"
+            aliases = [str(a) for a in (proj.get("aliases") or [])]
+            _upsert_project(conn, org_id, project_id, name, proj.get("description", ""),
+                            proj.get("repo_url", ""), aliases, proj.get("context", ""))
+            _set_ownership(conn, org_id, project_id, user_id, owner_role)
+            saved_projects.append({"project_id": project_id, "name": name, "role": owner_role})
+    reproject_org(org_id)
+    return {
+        "onboarded": True, "user_id": user_id, "role": role, "level": level,
+        "reports_to": saved_managers, "skills": saved_skills, "projects": saved_projects,
+        "commit_history_opt_in": bool(store_commit_history),
+    }
+
+
+@remote_mcp.tool()
+def get_org_graph(auth_token: str) -> dict[str, Any]:
+    """Return the organization knowledge graph (nodes + edges) for visualization."""
+    user = require_auth(auth_token)
+    data = graph.fetch_org_graph(user["org_id"])
+    return {"org_id": user["org_id"], "nodes": data["nodes"], "edges": data["edges"]}
+
+
+@remote_mcp.tool()
+def find_owner(auth_token: str, query: str) -> dict[str, Any]:
+    """Find which project/package matches `query` and who owns it (creator/maintainers)."""
+    user = require_auth(auth_token)
+    matches = graph.find_owner(user["org_id"], query)
+    return {"org_id": user["org_id"], "query": query, "matches": matches}
+
+
+@remote_mcp.tool()
+def ask_owner(auth_token: str, query: str, question: str) -> dict[str, Any]:
+    """Find the owner of a project/package matching `query` and ask them via the inbox.
+
+    Prefers the original creator, then any maintainer/contributor. The recipient still
+    reviews and approves the reply before it sends (propose_response -> send_response).
+    """
+    sender = require_auth(auth_token)
+    org_id = sender["org_id"]
+    matches = graph.find_owner(org_id, query)
+    if not matches:
+        raise ValueError(f"No project matching '{query}' found in your organization.")
+    top = matches[0]
+    owners = top.get("owners") or []
+    creator = next((o for o in owners if o.get("role") == "creator"), None)
+    target = creator or (owners[0] if owners else None)
+    if target is None:
+        raise ValueError(f"Project '{top['name']}' has no registered owner to ask.")
+    to_user_id = target["user_id"]
+    now = utc_now()
+    with db() as conn:
+        if USE_POSTGRES:
+            cursor = execute(conn,
+                "INSERT INTO org_messages (org_id, from_user_id, to_user_id, query_text, status, created_at) "
+                "VALUES (?, ?, ?, ?, 'pending', ?) RETURNING id",
+                (org_id, sender["user_id"], to_user_id, question, now))
+            message_id = cursor.fetchone()["id"]
+        else:
+            cursor = execute(conn,
+                "INSERT INTO org_messages (org_id, from_user_id, to_user_id, query_text, status, created_at) "
+                "VALUES (?, ?, ?, ?, 'pending', ?)",
+                (org_id, sender["user_id"], to_user_id, question, now))
+            message_id = cursor.lastrowid
+    record_interaction(org_id, sender["user_id"], to_user_id)
+    reproject_org(org_id)
+    return {
+        "sent": True, "message_id": message_id,
+        "matched_project": {"project_id": top["project_id"], "name": top["name"], "score": top["score"]},
+        "asked": {"user_id": to_user_id, "name": target.get("name"), "role": target.get("role")},
+        "question": question, "created_at": now,
+    }
+
+
+def _tokens(text: str) -> list[str]:
+    out, cur = [], []
+    for ch in text.lower():
+        if ch.isalnum():
+            cur.append(ch)
+        elif cur:
+            out.append("".join(cur))
+            cur = []
+    if cur:
+        out.append("".join(cur))
+    return out
+
+
+def _skill_token_match(tok: str, sk: str) -> bool:
+    """Match a query token to a skill: exact, or substring only for tokens >=3 chars
+    (so 'authentication' matches 'auth' but short tokens like 'ml'/'go' need equality)."""
+    if not tok:
+        return False
+    if tok == sk:
+        return True
+    return len(tok) >= 3 and len(sk) >= 3 and (tok in sk or sk in tok)
+
+
+def _skill_hits(skills: set[str], tokens: set[str]) -> list[str]:
+    hits = set()
+    for sk in skills:
+        if any(_skill_token_match(tok, sk) for tok in tokens):
+            hits.add(sk)
+    return sorted(hits)
+
+
+ROLE_POINTS = {"creator": 5, "maintainer": 3, "contributor": 2}
+
+
+@remote_mcp.tool()
+def who_should_i_ask(auth_token: str, query: str) -> dict[str, Any]:
+    """Rank coworkers to ask about a package/project/topic (graph-powered routing).
+
+    Combines project ownership (creator > maintainer > contributor), commit-contribution
+    volume, matching skills, how often you already talk with them, and reporting distance
+    in the org graph. Returns ranked candidates each with a score breakdown and reason.
+    """
+    asker = require_auth(auth_token)
+    org_id, me = asker["org_id"], asker["user_id"]
+    snap = _org_snapshot(org_id)
+    matches = graph.find_owner(org_id, query)
+    matched_pids = {m["project_id"] for m in matches[:3]}
+    tokens = set(_tokens(query))
+
+    skills_by_user: dict[str, set[str]] = defaultdict(set)
+    for s in snap["skills"]:
+        skills_by_user[s["user_id"]].add(s["skill"].lower())
+    commits_by: dict[tuple[str, str], int] = {
+        (c["user_id"], c["project_id"]): c["commits"] for c in snap["contributions"]}
+    own_by: dict[str, dict[str, str]] = defaultdict(dict)
+    for o in snap["ownership"]:
+        own_by[o["user_id"]][o["project_id"]] = o["role"]
+    familiarity: dict[str, int] = defaultdict(int)
+    for i in snap["interactions"]:
+        if me in (i["user_a_id"], i["user_b_id"]):
+            other = i["user_b_id"] if i["user_a_id"] == me else i["user_a_id"]
+            familiarity[other] += i["message_count"]
+    info = {u["user_id"]: u for u in snap["users"]}
+
+    candidates = set()
+    for uid in info:
+        if uid == me:
+            continue
+        owns_matched = any(p in matched_pids for p in own_by.get(uid, {}))
+        commits_matched = any((uid, p) in commits_by for p in matched_pids)
+        skill_matched = bool(_skill_hits(skills_by_user.get(uid, set()), tokens))
+        if owns_matched or commits_matched or skill_matched:
+            candidates.add(uid)
+
+    ranked = []
+    for uid in candidates:
+        roles_here = [own_by[uid][p] for p in own_by.get(uid, {}) if p in matched_pids]
+        own_pts = max([ROLE_POINTS.get(r, 0) for r in roles_here] or [0])
+        commits = sum(commits_by.get((uid, p), 0) for p in matched_pids)
+        commit_pts = min(commits, 50) / 10.0
+        matched_skills = _skill_hits(skills_by_user.get(uid, set()), tokens)
+        skill_pts = 2.0 * len(matched_skills)
+        fam = familiarity.get(uid, 0)
+        fam_pts = min(fam, 5) * 0.4
+        dist = graph.reporting_distance(org_id, me, uid)
+        close_pts = 0.0 if dist is None else max(0, 3 - dist) * 0.5
+        score = own_pts + commit_pts + skill_pts + fam_pts + close_pts
+        reasons = []
+        if roles_here:
+            best = min(roles_here, key=lambda r: -ROLE_POINTS.get(r, 0))
+            reasons.append(f"{best} of a matching project")
+        if commits:
+            reasons.append(f"{commits} commits there")
+        if matched_skills:
+            reasons.append("skills: " + ", ".join(matched_skills))
+        if fam:
+            reasons.append(f"you've talked {fam}x")
+        if dist:
+            reasons.append(f"{dist} reporting hop(s) away")
+        ranked.append({
+            "user_id": uid, "name": info[uid]["name"], "role": info[uid]["role"],
+            "level": info[uid]["level"], "score": round(score, 2),
+            "breakdown": {"ownership": own_pts, "commits": round(commit_pts, 2),
+                          "skills": skill_pts, "familiarity": round(fam_pts, 2),
+                          "closeness": round(close_pts, 2)},
+            "reason": "; ".join(reasons) or "topic/skill match",
+        })
+    ranked.sort(key=lambda r: r["score"], reverse=True)
+    return {
+        "org_id": org_id, "query": query,
+        "matched_projects": [{"project_id": m["project_id"], "name": m["name"]} for m in matches[:3]],
+        "candidates": ranked[:5],
+    }
+
+
+@remote_mcp.tool()
+def rank_experts(auth_token: str, skill: str) -> dict[str, Any]:
+    """Rank people in your org by expertise in a skill/technology.
+
+    Scored by having the skill, total commit volume, and how many projects they own.
+    """
+    user = require_auth(auth_token)
+    org_id = user["org_id"]
+    snap = _org_snapshot(org_id)
+    token = skill.strip().lower()
+    commits_total: dict[str, int] = defaultdict(int)
+    for c in snap["contributions"]:
+        commits_total[c["user_id"]] += c["commits"]
+    owns_count: dict[str, int] = defaultdict(int)
+    for o in snap["ownership"]:
+        owns_count[o["user_id"]] += 1
+    info = {u["user_id"]: u for u in snap["users"]}
+
+    best: dict[str, dict[str, Any]] = {}
+    for s in snap["skills"]:
+        sk = s["skill"].lower()
+        if not _skill_token_match(token, sk):
+            continue
+        uid = s["user_id"]
+        score = 3.0 + min(commits_total[uid], 100) / 10.0 + 1.5 * owns_count[uid]
+        entry = {
+            "user_id": uid, "name": info[uid]["name"], "skill": s["skill"],
+            "role": info[uid]["role"], "level": info[uid]["level"],
+            "total_commits": commits_total[uid], "projects_owned": owns_count[uid],
+            "score": round(score, 2),
+        }
+        if uid not in best or entry["score"] > best[uid]["score"]:
+            best[uid] = entry
+    experts = sorted(best.values(), key=lambda r: r["score"], reverse=True)
+    return {"org_id": org_id, "skill": skill, "experts": experts[:10]}
+
+
+@remote_mcp.tool()
+def set_commit_history_consent(auth_token: str, opt_in: bool) -> dict[str, Any]:
+    """Set whether your commit contribution history may be stored in ctalk (opt-in).
+
+    Opting out also deletes any commit data already stored for you.
+    """
+    user = require_auth(auth_token)
+    org_id, user_id = user["org_id"], user["user_id"]
+    with db() as conn:
+        execute(conn, "UPDATE users SET commit_history_opt_in = ? WHERE org_id = ? AND user_id = ?",
+                (1 if opt_in else 0, org_id, user_id))
+        if not opt_in:
+            execute(conn, "DELETE FROM contributions WHERE org_id = ? AND user_id = ?", (org_id, user_id))
+    reproject_org(org_id)
+    return {
+        "updated": True, "user_id": user_id, "commit_history_opt_in": bool(opt_in),
+        "note": "Commit history will be stored." if opt_in
+                else "Commit history disabled; any stored commit data was deleted.",
+    }
+
+
+@remote_mcp.tool()
+def record_commits(auth_token: str, project_id: str, commits: int, last_commit_at: str = "") -> dict[str, Any]:
+    """Store your commit-contribution count for a project. Requires commit-history consent.
+
+    Run set_commit_history_consent(opt_in=True) first (or onboard with
+    store_commit_history=True). Feeds expertise ranking and who_should_i_ask.
+    """
+    user = require_auth(auth_token)
+    org_id, user_id = user["org_id"], user["user_id"]
+    project_id = normalize_id(project_id, "project_id")
+    with db() as conn:
+        row = execute(conn, "SELECT commit_history_opt_in FROM users WHERE org_id = ? AND user_id = ?",
+                      (org_id, user_id)).fetchone()
+        if not row or not row["commit_history_opt_in"]:
+            raise ValueError("Commit history is not enabled. Call set_commit_history_consent(opt_in=True) first.")
+        if execute(conn, "SELECT 1 FROM projects WHERE org_id = ? AND project_id = ?",
+                   (org_id, project_id)).fetchone() is None:
+            raise ValueError(f"Project '{project_id}' not found. Create it via onboard first.")
+        execute(conn,
+            """
+            INSERT INTO contributions (org_id, project_id, user_id, commits, last_commit_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(org_id, project_id, user_id) DO UPDATE SET
+                commits = excluded.commits, last_commit_at = excluded.last_commit_at
+            """,
+            (org_id, project_id, user_id, int(commits), last_commit_at))
+    reproject_org(org_id)
+    return {"recorded": True, "project_id": project_id, "user_id": user_id, "commits": int(commits)}
+
+
+@app.get("/graph")
+def graph_page() -> FileResponse:
+    return FileResponse(GRAPH_PAGE)
+
+
+@app.get("/api/org-graph")
+def api_org_graph(auth_token: str) -> dict[str, Any]:
+    try:
+        user = require_auth(auth_token)
+    except ValueError as exc:
+        raise HTTPException(status_code=401, detail=str(exc))
+    data = graph.fetch_org_graph(user["org_id"])
+    return {"org_id": user["org_id"], "nodes": data["nodes"], "edges": data["edges"]}
 
 
 mcp_app = remote_mcp.streamable_http_app()
