@@ -30,54 +30,57 @@
 <body>
   <h1>ctalk setup</h1>
 
-  <p>
-    ctalk lets Claude Code users send questions to each other.
-    Add the remote MCP server once, then use natural language.
-  </p>
+  <p>ctalk lets Claude Code users send questions inside a private organization.</p>
 
   <p><b>MCP URL:</b> <code>https://ctalk-relay.onrender.com/mcp</code></p>
 
   <h2>1. Add ctalk to Claude Code</h2>
 
-  <p>Paste this in Terminal:</p>
-
   <pre><code>claude mcp add --transport http ctalk https://ctalk-relay.onrender.com/mcp -s user</code></pre>
 
-  <p>Check that it worked:</p>
+  <p>Check:</p>
 
   <pre><code>claude mcp list</code></pre>
 
-  <p>You should see <code>ctalk</code> connected.</p>
+  <h2>2. Create an organization</h2>
 
-  <h2>2. Register yourself</h2>
+  <p>One person does this first:</p>
 
-  <p>Open Claude Code and say something like:</p>
+  <pre><code>ctalk register organization with org_id ai-company, name "The AI Company", and admin password "choose-a-long-admin-password".</code></pre>
 
-  <pre><code>ctalk register me with user_id umar. My name is Umar. I own platform tooling and payments for Spectra.</code></pre>
+  <p>Save the <code>org_id</code> and admin password. The admin password is needed to add users.</p>
 
-  <p>Use your own short <code>user_id</code>, like <code>john</code>, <code>sarah</code>, or <code>umar</code>.</p>
+  <h2>3. Register a user</h2>
 
-  <h2>3. Send a message</h2>
+  <pre><code>ctalk register user umar in org ai-company with admin password "choose-a-long-admin-password", password "choose-a-user-password", name Umar, ownership platform tooling and payments.</code></pre>
 
-  <pre><code>ctalk ask john from umar: Can you look at the retry logic in alpha-repo?</code></pre>
+  <h2>4. Login</h2>
 
-  <h2>4. Check inbox</h2>
+  <pre><code>ctalk login to org ai-company as umar with password "choose-a-user-password".</code></pre>
 
-  <pre><code>ctalk check inbox for john.</code></pre>
+  <p>Claude should reuse the returned <code>auth_token</code> for the rest of that chat. Treat it like a password.</p>
 
-  <h2>5. Reply</h2>
+  <h2>5. Send a message</h2>
+
+  <pre><code>ctalk ask john: Can you look at the retry logic in alpha-repo?</code></pre>
+
+  <h2>6. Check inbox</h2>
+
+  <pre><code>ctalk check my inbox.</code></pre>
+
+  <h2>7. Reply</h2>
 
   <p>Draft first:</p>
 
-  <pre><code>ctalk propose a response as john to message 1: The retry logic uses three attempts with exponential backoff.</code></pre>
+  <pre><code>ctalk propose a response to message 1: The retry logic uses three attempts with exponential backoff.</code></pre>
 
   <p>After the human approves, send:</p>
 
-  <pre><code>ctalk send the approved response as john to message 1: The retry logic uses three attempts with exponential backoff.</code></pre>
+  <pre><code>ctalk send the approved response to message 1: The retry logic uses three attempts with exponential backoff.</code></pre>
 
-  <h2>6. Check replies</h2>
+  <h2>8. Check replies</h2>
 
-  <pre><code>ctalk check replies for umar.</code></pre>
+  <pre><code>ctalk check my replies.</code></pre>
 
   <hr>
 
@@ -86,13 +89,6 @@
     <a href="https://ctalk-relay.onrender.com/health">https://ctalk-relay.onrender.com/health</a>
   </p>
 
-  <p>
-    API docs:
-    <a href="https://ctalk-relay.onrender.com/docs">https://ctalk-relay.onrender.com/docs</a>
-  </p>
-
-  <p>
-    Note: this is a v0 with no auth. Render free-tier storage is temporary, so people may need to register again after restarts.
-  </p>
+  <p>Host note: for real use, deploy ctalk with a Postgres <code>DATABASE_URL</code>, such as Neon on Railway.</p>
 </body>
 </html>
