@@ -434,7 +434,7 @@ def record_interaction(org_id: str, user_a_id: str, user_b_id: str) -> None:
             ) VALUES (?, ?, ?, 1, ?)
             ON CONFLICT(org_id, user_a_id, user_b_id)
             DO UPDATE SET
-                message_count = message_count + 1,
+                message_count = user_interactions.message_count + 1,
                 last_interaction_at = excluded.last_interaction_at
             """,
             (org_id, first_user, second_user, now),
